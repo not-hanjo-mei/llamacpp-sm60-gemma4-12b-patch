@@ -75,19 +75,26 @@ llama-server \
   --mmproj models/mmproj-gemma-4-12b-it-qat-q4_0.gguf \
   --spec-type draft-mtp -md models/gemma-4-12b-it-assistant-q4_0.gguf \
   --spec-draft-n-max 6 --spec-draft-p-min 0.95 \
-  -ngl 99 -ngld 99 -fit off -c 196608 -b 2048 -ub 2048 \
+  -ngl 99 -ngld 99 -fit off -c 196608 -np 2 -kvu -b 2048 -ub 2048 \
   --host 0.0.0.0 --port 8080
 ```
 
 Notes:
 
+- `-kvu` (unified KV pool) is required when `-np` is set explicitly. Without it llama-server
+  statically splits the context per slot (196K / 2 = 98K each) and, worse, two concurrent long
+  prefills exhaust the compute-buffer pool and the server **aborts with a CUDA OOM**. With
+  `-kvu` all slots draw from one 196K-token pool, so a single conversation can use the whole
+  window and concurrent requests queue instead of overflowing.
 - `-b 2048 -ub 2048` is worth ~20% prefill at 8K on this GPU (ub=1024 is *slower* than 512 —
-  don't assume monotonicity).
+  don't assume monotonicity). It costs ~2.2 GB of compute buffers vs ub=512, which is why
+  192K + two slots only fits with a 196K (not 256K) pool.
 - `--spec-draft-p-min 0.95` with `n-max 6` is the measured sweet spot; the draft stops early
   when its confidence drops, which keeps the target verification batch small.
 - `-fit off` is required: llama.cpp's new auto-fit step builds the draft context without
   `ctx_other`, and draft-MTP init fails.
-- 192K context + mmproj + draft uses ~14.9 GB. Drop to `-c 131072` (~11.5 GB) for more headroom.
+- VRAM on a 16 GB P100: 14.2 GB after load, ~14.4 GB peak with two concurrent requests.
+  For more headroom use `-c 131072` (~11.5 GB).
 - Sampling: the model expects `temp=1.0, top_p=0.95` for its default behavior; thinking-mode
   responses put the reasoning in `reasoning_content` (OpenAI-compatible API) — `max_tokens`
   must exceed the thinking length or `content` will be empty.
