@@ -1,0 +1,87 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 612d3e3..5958e25 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -89,6 +89,16 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
+     }
+ }
+ 
++// Rows per block for GP100 (ported from qr0n/p100-llama-cpp patch 0002): sm_60
++// emulates __dp4a, so the kernel is instruction-issue bound; sharing activation
++// work across several rows per block is the dominant win for ncols_dst == 1.
++#ifndef GGML_CUDA_MMVQ_ROWS_PASCAL_K
++#define GGML_CUDA_MMVQ_ROWS_PASCAL_K 4
++#endif
++#ifndef GGML_CUDA_MMVQ_ROWS_PASCAL
++#define GGML_CUDA_MMVQ_ROWS_PASCAL 2
++#endif
++
+ enum mmvq_parameter_table_id {
+     MMVQ_PARAMETERS_GENERIC = 0,
+     MMVQ_PARAMETERS_TURING,
+@@ -96,7 +106,8 @@ enum mmvq_parameter_table_id {
+     MMVQ_PARAMETERS_RDNA2,
+     MMVQ_PARAMETERS_RDNA3_0,
+     MMVQ_PARAMETERS_RDNA4,
+-    MMVQ_PARAMETERS_GB10
++    MMVQ_PARAMETERS_GB10,
++    MMVQ_PARAMETERS_PASCAL
+ };
+ 
+ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+@@ -112,6 +123,9 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+     return MMVQ_PARAMETERS_TURING;
+ #elif __CUDA_ARCH__ == GGML_CUDA_CC_GB10
+     return MMVQ_PARAMETERS_GB10;
++#elif __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
++    // GP100 only. sm_61 (P40/P4) has __dp4a and keeps the generic parameters.
++    return MMVQ_PARAMETERS_PASCAL;
+ #else
+     return MMVQ_PARAMETERS_GENERIC;
+ #endif
+@@ -136,6 +150,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_GB10) {
+         return MMVQ_PARAMETERS_GB10;
+     }
++    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_PASCAL) {
++        return MMVQ_PARAMETERS_PASCAL;
++    }
+     return MMVQ_PARAMETERS_GENERIC;
+ }
+ 
+@@ -580,6 +597,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+         }
+         return generic;
+     }
++    if (table_id == MMVQ_PARAMETERS_PASCAL) {
++        return calc_nwarps(type, ncols_dst, MMVQ_PARAMETERS_GENERIC, small_k, halve_iters);
++    }
+     return 1;
+ }
+ 
+@@ -598,6 +618,25 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
+ }
+ 
+ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
++    if (table_id == MMVQ_PARAMETERS_PASCAL) {
++        // Only batch-size-1 is retuned; everything else defers to the generic table.
++        if (ncols_dst != 1) {
++            return calc_rows_per_block(type, ncols_dst, MMVQ_PARAMETERS_GENERIC, small_k, nwarps);
++        }
++        if (small_k) {
++            return nwarps;
++        }
++        switch (type) {
++            case GGML_TYPE_Q2_K:
++            case GGML_TYPE_Q3_K:
++            case GGML_TYPE_Q4_K:
++            case GGML_TYPE_Q5_K:
++            case GGML_TYPE_Q6_K:
++                return GGML_CUDA_MMVQ_ROWS_PASCAL_K;
++            default:
++                return GGML_CUDA_MMVQ_ROWS_PASCAL;
++        }
++    }
+     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+         switch (ncols_dst) {
+             case 1:
